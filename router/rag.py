@@ -9,11 +9,29 @@ import threading
 from pathlib import Path
 
 from router.documents import extract_text, iter_source_files
+from router.stdio import patch_pythonw_stdio
 
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
-_collection_name = "exam_context"
+_collection_name = "clip_context"
+_query_timeout_s = 3.0
+_rag_failures = 0
+_rag_session_disabled = False
+_MAX_RAG_FAILURES = 2
+
+
+def _note_rag_failure(reason: str) -> None:
+    global _rag_failures, _rag_session_disabled
+    _rag_failures += 1
+    if _rag_failures >= _MAX_RAG_FAILURES and not _rag_session_disabled:
+        _rag_session_disabled = True
+        logger.warning(
+            "RAG disabled for this session after %d failures (last: %s). "
+            "Set RAG_ENABLED=false in .env or fix the index via scripts\\index_rag.bat.",
+            _rag_failures,
+            reason,
+        )
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -116,6 +134,7 @@ def chunk_text(text: str, size: int | None = None, overlap: int | None = None) -
 
 
 def _get_client(index_path: Path):
+    patch_pythonw_stdio()
     import chromadb
     from chromadb.config import Settings
 
@@ -191,16 +210,43 @@ def ensure_index(source_dir: Path, base_dir: Path) -> None:
         rebuild_index(source_dir, base_dir)
 
 
+def _query_collection(collection, question: str, k: int) -> dict | None:
+    """Run Chroma query with a timeout so the hotkey lock is not held indefinitely."""
+    result: list[dict | None] = [None]
+    error: list[BaseException | None] = [None]
+
+    def _run() -> None:
+        try:
+            result[0] = collection.query(query_texts=[question], n_results=k)
+        except BaseException as exc:  # noqa: BLE001
+            error[0] = exc
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(_query_timeout_s)
+    if worker.is_alive():
+        logger.warning("RAG query timed out after %.0fs", _query_timeout_s)
+        return None
+    if error[0] is not None:
+        raise error[0]
+    return result[0]
+
+
 def retrieve(question: str, source_dir: Path, base_dir: Path) -> str:
     """Return formatted retrieved chunks for the prompt."""
+    global _rag_session_disabled
+
     question = (question or "").strip()
-    if not question:
+    if not question or _rag_session_disabled:
         return ""
 
-    ensure_index(source_dir, base_dir)
+    # Index builds are done via scripts/index_rag.py — do not rebuild on every hotkey.
     idx_path = index_dir(base_dir)
     if not (idx_path / "chroma.sqlite3").exists():
-        logger.warning("RAG index missing; add files to %s and retry.", source_dir)
+        logger.warning(
+            "RAG index missing; run scripts\\index_rag.bat after adding files to %s",
+            source_dir,
+        )
         return ""
 
     with _lock:
@@ -208,15 +254,20 @@ def retrieve(question: str, source_dir: Path, base_dir: Path) -> str:
         try:
             collection = client.get_collection(_collection_name)
         except Exception:
-            logger.warning("RAG collection not found.")
+            logger.warning("RAG collection not found; run scripts\\index_rag.bat.")
             return ""
 
         k = top_k()
         try:
-            results = collection.query(query_texts=[question], n_results=k)
+            results = _query_collection(collection, question, k)
         except Exception as exc:
             logger.warning("RAG query failed: %s", exc)
+            _note_rag_failure(str(exc))
             return ""
+
+    if results is None:
+        _note_rag_failure("timeout")
+        return ""
 
     docs = (results.get("documents") or [[]])[0]
     metas = (results.get("metadatas") or [[]])[0]

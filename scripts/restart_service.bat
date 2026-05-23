@@ -1,9 +1,9 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
-echo Restarting exam helper...
-call "%~dp0scripts\run_service.bat"
+echo Restarting Clip Assist...
+call "%~dp0run_service.bat"
 if errorlevel 1 exit /b 1
 
 echo.

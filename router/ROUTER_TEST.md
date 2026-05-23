@@ -4,10 +4,14 @@
 
 1. Run **`setup.bat`** in the project root.
    - Prompts for Python paths, optional ntfy notifications, and API keys.
-   - Writes `.env`, installs requirements, optionally registers Windows logon startup.
-2. For development restarts: **`restart_service.bat`** (add `--nopause` to skip the final pause).
-3. Put study files in **`context/`** (PDF, xlsx, txt, md). Run **`index_rag.bat`** after adding or changing files (or enable RAG in setup to index automatically).
-4. With **RAG_ENABLED=true**, only the most relevant chunks are sent to the model instead of every file.
+   - Writes `.env`, installs requirements, then asks how to launch:
+     - **1** Desktop shortcut (default), **2** Windows logon auto-start, or **3** manual only.
+   - Only one method is configured; switching removes the other (e.g. logon task vs Desktop shortcut).
+2. **Start:** double-click **Clip Assist** on your Desktop (or `scripts\start_clip_assist.vbs`).
+3. **Stop logon task** if you used it before: `scripts\remove_from_startup.bat`.
+4. Put study files in **`context/`** (PDF, xlsx, txt, md). Run **`scripts\index_rag.bat`** after adding or changing files.
+5. With **RAG_ENABLED=true**, only the most relevant chunks are sent to the model instead of every file.
+6. For development restarts: **`scripts\restart_service.bat`** (add `--nopause` to skip the final pause).
 
 ## Quick CLI test (no hotkey)
 
@@ -27,7 +31,7 @@ print(ans[:200])
 
 ### 1. Short question → fast tier
 
-- Select a short exam question (~50 chars), press Ctrl+B.
+- Highlight a short question (~50 chars) and press Ctrl+B (selection is copied automatically).
 - Check `app.log` for `tier=fast` and a fast provider (e.g. `groq-llama`, `gemini-flash`).
 
 ### 2. Invalid Gemini key → failover

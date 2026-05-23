@@ -14,11 +14,21 @@ import yaml
 
 from router import classifier, health, quality
 from router.images import ImageAttachment
+from router.stdio import patch_pythonw_stdio
+
+patch_pythonw_stdio()
 
 logger = logging.getLogger(__name__)
 
 litellm.suppress_debug_info = True
 litellm.drop_params = True
+litellm.set_verbose = False
+
+for _log_name in ("LiteLLM", "litellm", "httpx", "httpcore"):
+    _litellm_log = logging.getLogger(_log_name)
+    _litellm_log.handlers.clear()
+    _litellm_log.addHandler(logging.NullHandler())
+    _litellm_log.propagate = False
 
 _CONFIG_PATH = Path(__file__).with_name("config.yaml")
 _TIER_ORDER = ("fast", "balanced", "reasoning")
@@ -206,8 +216,20 @@ def complete(
 
     attempts = 0
     last_error: Exception | None = None
+    try:
+        deadline_s = float(os.environ.get("ROUTER_DEADLINE_S", "45"))
+    except ValueError:
+        deadline_s = 45.0
+    deadline = time.perf_counter() + max(10.0, deadline_s)
 
     for tier, provider in queue:
+        if time.perf_counter() > deadline:
+            logger.warning(
+                "Router deadline (%.0fs) reached after %d attempt(s).",
+                deadline_s,
+                attempts,
+            )
+            break
         tier_idx = _tier_index(tier)
         if tier_idx < min_tier_idx:
             continue

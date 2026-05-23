@@ -1,9 +1,14 @@
 """
-Headless hotkey service: Ctrl+B copies selection, queries LLM via meta-router, copies answer.
+Headless hotkey service: Ctrl+B copies the current selection, queries LLM via meta-router,
+and copies the answer to the clipboard.
 
 Uses Windows RegisterHotKey (no low-level keyboard hook).
 Run at logon (hidden): pythonw.exe app.py
 """
+
+from router.stdio import patch_pythonw_stdio
+
+patch_pythonw_stdio()
 
 from router.hotkey import load_hotkey_from_env
 from router.images import (
@@ -21,6 +26,7 @@ import sys
 import time
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from ctypes import wintypes
 from pathlib import Path
 
@@ -36,12 +42,13 @@ if str(APP_DIR) not in sys.path:
 load_dotenv(APP_DIR / ".env")
 
 LOG_PATH = APP_DIR / "app.log"
-FOLDER_PATH = APP_DIR
 CONTEXT_PATH = APP_DIR / "context"
+REQUEST_TIMEOUT_S = max(30, int(os.environ.get("REQUEST_TIMEOUT_S", "90")))
 NTFY_MAX_BODY = 3500
+APP_NAME = "Clip Assist"
 APP_BUILD = "2026-05-23-meta-router"
 HOTKEY_ID = 1
-MUTEX_NAME = "Global\\DataHotkeyExamHelper"
+MUTEX_NAME = "Global\\ClipAssistSvc"
 ERROR_ALREADY_EXISTS = 183
 
 WM_HOTKEY = 0x0312
@@ -105,6 +112,9 @@ _base_instruction = (
 )
 
 _busy = threading.Lock()
+_llm_executor = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="clip-assist-llm"
+)
 
 
 def _ensure_single_instance() -> None:
@@ -194,12 +204,10 @@ def _load_files_from_dir(folder: Path, file_data: str) -> str:
 
 
 def load_context_files() -> str:
-    """Load full file text (used when RAG is off or returns nothing)."""
-    file_data = ""
-    file_data = _load_files_from_dir(FOLDER_PATH, file_data)
-    if CONTEXT_PATH.is_dir():
-        file_data = _load_files_from_dir(CONTEXT_PATH, file_data)
-    return file_data
+    """Load full file text from context/ (used when RAG is off or returns nothing)."""
+    if not CONTEXT_PATH.is_dir():
+        return ""
+    return _load_files_from_dir(CONTEXT_PATH, "")
 
 
 def load_prompt_context(question: str) -> str:
@@ -214,23 +222,41 @@ def load_prompt_context(question: str) -> str:
 
 
 def load_context_images() -> list[ImageAttachment]:
-    return collect_from_dirs(FOLDER_PATH, CONTEXT_PATH)
+    if not CONTEXT_PATH.is_dir():
+        return []
+    return collect_from_dirs(CONTEXT_PATH)
+
+
+def send_ctrl_c() -> None:
+    """Copy the current selection to the clipboard (Windows Ctrl+C)."""
+    VK_CONTROL = 0x11
+    VK_C = 0x43
+    KEYEVENTF_KEYUP = 0x0002
+    user32.keybd_event(VK_CONTROL, 0, 0, 0)
+    user32.keybd_event(VK_C, 0, 0, 0)
+    time.sleep(0.02)
+    user32.keybd_event(VK_C, 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+    time.sleep(0.1)
 
 
 def capture_from_clipboard() -> tuple[str, list[ImageAttachment]]:
     """
-    Read whatever is on the clipboard when the user presses the hotkey.
+    Copy the current selection (Ctrl+C), then read text and/or image from the clipboard.
 
-    Does not send Ctrl+C or any other keys. Copy your selection (Ctrl+C) and/or
-    take a screenshot (Win+Shift+S) first, then press your configured shortcut.
+    When text is captured, clipboard images are ignored so an old screenshot does not
+    override the selection. For image-only questions, use Win+Shift+S first, or press
+    the hotkey with only an image already on the clipboard and nothing selected.
     """
+    send_ctrl_c()
     text = pyperclip.paste().strip()
 
     images: list[ImageAttachment] = []
-    clip_image = attachment_from_clipboard(label="clipboard_image")
-    if clip_image:
-        images.append(clip_image)
-        logging.info("Captured clipboard image (%s).", clip_image.label)
+    if not text:
+        clip_image = attachment_from_clipboard(label="clipboard_image")
+        if clip_image:
+            images.append(clip_image)
+            logging.info("Captured clipboard image (%s).", clip_image.label)
 
     if text:
         logging.info("Captured %d chars of clipboard text.", len(text))
@@ -275,8 +301,11 @@ def ask_llm(question: str, images: list[ImageAttachment] | None = None) -> tuple
 def _handle_hotkey() -> None:
     if not _busy.acquire(blocking=False):
         logging.info("Hotkey ignored; previous request still running.")
-        ntfy_notify("Exam helper",
-                    "Still working on the previous question.", priority="3")
+        ntfy_notify(
+            APP_NAME,
+            "Still working on the previous question. Wait for the answer or a timeout message.",
+            priority="3",
+        )
         return
 
     try:
@@ -287,22 +316,35 @@ def _handle_hotkey() -> None:
         if not question and not has_images:
             pyperclip.copy("No text or image selected.")
             logging.warning("Empty selection.")
-            ntfy_notify("Exam helper",
+            ntfy_notify(APP_NAME,
                         "No text or image selected.", priority="3")
             return
 
         if not question and has_images:
-            question = "Answer the exam question shown in the image(s)."
+            question = "Answer the question shown in the image(s)."
 
         preview = question[:120] + ("…" if len(question) > 120 else "")
-        ntfy_notify("Exam helper", f"Working on:\n{preview}", priority="1")
+        ntfy_notify(APP_NAME, f"Working on:\n{preview}", priority="1")
 
         logging.info(
             "Sending %d chars, %d image(s) to meta-router.",
             len(question),
             len(clip_images) + len(context_images),
         )
-        answer, provider_id = ask_llm(question, images=clip_images)
+        future = _llm_executor.submit(ask_llm, question, clip_images)
+        try:
+            answer, provider_id = future.result(timeout=REQUEST_TIMEOUT_S)
+        except FuturesTimeoutError:
+            logging.error("LLM request timed out after %ds", REQUEST_TIMEOUT_S)
+            pyperclip.copy(
+                f"Request timed out after {REQUEST_TIMEOUT_S}s. Try again."
+            )
+            ntfy_notify(
+                APP_NAME,
+                f"Timed out after {REQUEST_TIMEOUT_S}s. Wait a moment, then try again.",
+                priority="4",
+            )
+            return
         pyperclip.copy(answer or "No response from model.")
         logging.info("Answer copied (%d chars) via %s.",
                      len(answer), provider_id)
@@ -315,7 +357,7 @@ def _handle_hotkey() -> None:
     except Exception as exc:
         pyperclip.copy(f"Error: {exc}")
         logging.exception("Hotkey handler failed.")
-        ntfy_notify("Exam helper failed", str(exc), priority="5")
+        ntfy_notify(f"{APP_NAME} failed", str(exc), priority="5")
     finally:
         _busy.release()
 
@@ -346,7 +388,7 @@ def main() -> None:
     logging.info(
         "Hotkey service started (%s via RegisterHotKey).", hotkey_display)
     ntfy_notify(
-        "Exam helper started",
+        f"{APP_NAME} started",
         f"Build {APP_BUILD} is running. {hotkey_display} is active.",
         "4",
     )
