@@ -1,0 +1,4 @@
+.env
+app.log
+router/state.json
+rag_index/
