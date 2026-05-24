@@ -93,7 +93,7 @@ def _log_llm_request(
 
 NTFY_MAX_BODY = 3500
 APP_NAME = "Clip Assist"
-APP_BUILD = "2026-05-24-tutorial-filter-fix"
+APP_BUILD = "2026-05-24-open-query-strict-v2"
 HOTKEY_ID = 1
 MUTEX_NAME = "Global\\ClipAssistSvc"
 ERROR_ALREADY_EXISTS = 183

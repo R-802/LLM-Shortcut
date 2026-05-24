@@ -6,6 +6,7 @@ import gc
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -119,6 +120,70 @@ def max_distance() -> float:
         return float(os.environ.get("RAG_MAX_DISTANCE", "0.82"))
     except ValueError:
         return 0.82
+
+
+def max_distance_open() -> float:
+    """Stricter limit when the question does not name a specific context/ file."""
+    try:
+        return float(os.environ.get("RAG_MAX_DISTANCE_OPEN", "0.62"))
+    except ValueError:
+        return 0.62
+
+
+def open_query_min_term_hits() -> int:
+    """Distinctive keywords a chunk must share for an open (unnamed) query."""
+    try:
+        return max(1, int(os.environ.get("RAG_OPEN_TERM_MIN_HITS", "2")))
+    except ValueError:
+        return 2
+
+
+_RAG_TERM_STOPWORDS = frozenset({
+    "about", "after", "also", "application", "applications", "approximately",
+    "because", "being", "benefit", "between", "calculated", "capacity",
+    "change", "compare", "conditions", "context", "conventional", "define",
+    "delivered", "delivers", "describe", "difference", "discuss", "efficiency",
+    "efficiencies", "energy", "engine", "engines", "everything", "explain",
+    "factor", "files", "fluid", "following", "generation", "generator",
+    "important", "installed", "many", "model", "much", "normally",
+    "often", "operates", "operating", "other", "overall", "plant",
+    "plants", "power", "question", "receive", "report", "reservoir", "results",
+    "should", "show", "station", "stations", "such", "summarize", "summary",
+    "system", "systems", "table", "technology", "technologies", "tell", "temperature",
+    "that", "their", "there", "thermal", "these", "they", "this", "turbine",
+    "under", "used", "using", "value", "what", "when", "where", "which", "while",
+    "with", "would", "your",
+})
+
+
+def _distinct_question_terms(question: str) -> set[str]:
+    terms: set[str] = set()
+    for token in re.split(r"\W+", question.lower()):
+        if len(token) >= 4 and token not in _RAG_TERM_STOPWORDS and not token.isdigit():
+            terms.add(token)
+    return terms
+
+
+def _filter_chunks_by_question_terms(
+    question: str,
+    docs: list,
+    metas: list,
+    *,
+    min_hits: int = 1,
+) -> tuple[list, list]:
+    """Drop chunks that share no distinctive keywords with the question."""
+    terms = _distinct_question_terms(question)
+    if not terms:
+        return docs, metas
+
+    kept_docs: list = []
+    kept_metas: list = []
+    for doc, meta in zip(docs, metas):
+        body = chunk_body_for_prompt(str(doc)).lower()
+        if sum(1 for term in terms if term in body) >= min_hits:
+            kept_docs.append(doc)
+            kept_metas.append(meta)
+    return kept_docs, kept_metas
 
 
 def chunk_size() -> int:
@@ -819,7 +884,7 @@ def retrieve(question: str, source_dir: Path, base_dir: Path) -> tuple[str, str,
 
         k = min(top_k(), count)
         query_text = expand_query_with_sources(question, source_filter)
-        dist_limit = max_distance()
+        dist_limit = max_distance() if source_filter else max_distance_open()
 
         if source_filter:
             logger.info(
@@ -916,6 +981,20 @@ def retrieve(question: str, source_dir: Path, base_dir: Path) -> tuple[str, str,
     meta_list = list(metas or [])
     while len(meta_list) < len(docs):
         meta_list.append({})
+
+    if not source_filter:
+        min_hits = open_query_min_term_hits()
+        docs, meta_list = _filter_chunks_by_question_terms(
+            question, docs, meta_list, min_hits=min_hits
+        )
+        if not docs:
+            logger.info(
+                "RAG: open query — no chunk matched >=%d keyword(s); "
+                "no context attached (distinct terms: %s).",
+                min_hits,
+                ", ".join(sorted(_distinct_question_terms(question))) or "none",
+            )
+            return "", "below_threshold", []
 
     formatted = format_retrieved_passages(docs, meta_list)
     sources_used = list(dict.fromkeys(
