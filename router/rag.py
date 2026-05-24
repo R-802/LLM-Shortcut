@@ -139,20 +139,22 @@ def open_query_min_term_hits() -> int:
 
 
 _RAG_TERM_STOPWORDS = frozenset({
-    "about", "after", "also", "application", "applications", "approximately",
-    "because", "being", "benefit", "between", "calculated", "capacity",
-    "change", "compare", "conditions", "context", "conventional", "define",
-    "delivered", "delivers", "describe", "difference", "discuss", "efficiency",
-    "efficiencies", "energy", "engine", "engines", "everything", "explain",
-    "factor", "files", "fluid", "following", "generation", "generator",
-    "important", "installed", "many", "model", "much", "normally",
-    "often", "operates", "operating", "other", "overall", "plant",
-    "plants", "power", "question", "receive", "report", "reservoir", "results",
-    "should", "show", "station", "stations", "such", "summarize", "summary",
-    "system", "systems", "table", "technology", "technologies", "tell", "temperature",
-    "that", "their", "there", "thermal", "these", "they", "this", "turbine",
-    "under", "used", "using", "value", "what", "when", "where", "which", "while",
-    "with", "would", "your",
+    "about", "accounts", "actual", "after", "also", "application", "applications",
+    "approximately", "assume", "assuming", "because", "being", "benefit", "between",
+    "bought", "buying", "calculated", "capacity", "change", "coefficient", "compare",
+    "conditions", "consume", "context", "conventional", "cost", "define", "delivered",
+    "delivers", "density", "describe", "difference", "discuss", "efficiency",
+    "efficiencies", "electricity", "energy", "engine", "engines", "everything",
+    "explain", "factor", "files", "fluid", "following", "generation", "generator",
+    "heat", "heater", "heating", "house", "households", "important", "installed",
+    "many", "marks", "model", "much", "normally", "often", "operates", "operating",
+    "other", "overall", "performance", "plant", "plants", "power", "primary", "pump",
+    "question", "receive", "report", "reservoir", "residential", "results", "should",
+    "show", "station", "stations", "stove", "such", "summarize", "summary", "system",
+    "systems", "table", "technology", "technologies", "tell", "temperature", "that",
+    "their", "there", "thermal", "these", "they", "this", "turbine", "under", "used",
+    "using", "value", "volume", "what", "when", "where", "which", "while", "with",
+    "would", "your", "zealand",
 })
 
 
@@ -162,6 +164,10 @@ def _distinct_question_terms(question: str) -> set[str]:
         if len(token) >= 4 and token not in _RAG_TERM_STOPWORDS and not token.isdigit():
             terms.add(token)
     return terms
+
+
+def _term_in_text(term: str, text: str) -> bool:
+    return re.search(rf"\b{re.escape(term)}", text, re.IGNORECASE) is not None
 
 
 def _filter_chunks_by_question_terms(
@@ -176,13 +182,19 @@ def _filter_chunks_by_question_terms(
     if not terms:
         return docs, metas
 
+    specific = {t for t in terms if len(t) >= 8}
+
     kept_docs: list = []
     kept_metas: list = []
     for doc, meta in zip(docs, metas):
         body = chunk_body_for_prompt(str(doc)).lower()
-        if sum(1 for term in terms if term in body) >= min_hits:
-            kept_docs.append(doc)
-            kept_metas.append(meta)
+        hits = sum(1 for term in terms if _term_in_text(term, body))
+        if hits < min_hits:
+            continue
+        if specific and not any(_term_in_text(term, body) for term in specific):
+            continue
+        kept_docs.append(doc)
+        kept_metas.append(meta)
     return kept_docs, kept_metas
 
 
@@ -551,15 +563,37 @@ def _load_named_sources_from_disk(
     return combined, loaded
 
 
-def rebuild_index(source_dir: Path, base_dir: Path) -> int:
-    """Re-ingest all files under source_dir. Returns chunk count."""
+def _clear_staging_dir(staging: Path) -> None:
+    if not staging.exists():
+        return
+    for attempt in range(5):
+        try:
+            shutil.rmtree(staging)
+            return
+        except OSError:
+            gc.collect()
+            time.sleep(0.3 * (attempt + 1))
+    raise OSError(f"Could not clear RAG staging folder: {staging}")
+
+
+def _staging_build_in_progress(staging: Path) -> bool:
+    if not staging.exists():
+        return False
+    return any(staging.rglob("chroma.sqlite3")) or any(staging.rglob("data_level0.bin"))
+
+
+def rebuild_index(source_dir: Path, base_dir: Path) -> int | None:
+    """Re-ingest all files under source_dir. Returns chunk count, or None if skipped."""
     source_dir = source_dir.resolve()
     base_dir = base_dir.resolve()
     idx_path = index_dir(base_dir)
     staging = base_dir / "rag_index_staging"
 
-    if staging.exists():
-        shutil.rmtree(staging, ignore_errors=True)
+    if _staging_build_in_progress(staging):
+        logger.info("RAG rebuild skipped: staging index build already in progress.")
+        return None
+
+    _clear_staging_dir(staging)
     staging.mkdir(parents=True)
 
     count = _populate_index_at(staging, source_dir, base_dir)
@@ -597,6 +631,11 @@ def ensure_index(source_dir: Path, base_dir: Path) -> int | None:
         return None
 
     if not index_is_stale(source_dir, base_dir):
+        return None
+
+    staging = base_dir / "rag_index_staging"
+    if _staging_build_in_progress(staging):
+        logger.info("RAG rebuild skipped: staging index build already in progress.")
         return None
 
     schedule = _get_rebuild_schedule_lock()
