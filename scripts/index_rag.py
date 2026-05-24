@@ -14,8 +14,10 @@ from dotenv import load_dotenv
 
 load_dotenv(ROOT / ".env")
 
-from router.rag import rebuild_index  # noqa: E402
+from router.rag import consolidate_pending_index, rebuild_index  # noqa: E402
 
 CONTEXT = ROOT / "context"
 count = rebuild_index(CONTEXT, ROOT)
+if consolidate_pending_index(ROOT):
+    print("Consolidated rag_index_pending into rag_index/.")
 print(f"Indexed {count} chunks from {CONTEXT}")

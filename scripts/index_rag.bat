@@ -3,8 +3,12 @@ setlocal
 cd /d "%~dp0.."
 echo Optional manual RAG rebuild. Clip Assist auto-re-indexes context/ when running.
 echo Stopping Clip Assist so the RAG index is not locked...
+for /f "delims=" %%t in ('powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0read_env.ps1" -Key TASK_NAME 2^>nul') do (
+  schtasks /End /TN "%%t" >nul 2>&1
+)
 taskkill /F /IM pythonw.exe >nul 2>&1
-timeout /t 2 /nobreak >nul
+REM Wait for Chroma/SQLite handles to release on Windows.
+timeout /t 5 /nobreak >nul
 for /f "delims=" %%p in ('powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0read_env.ps1" -Key PYTHON_EXE') do set "PY=%%p"
 if not defined PY set "PY=python"
 "%PY%" "%~dp0index_rag.py"

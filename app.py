@@ -6,7 +6,6 @@ Uses Windows RegisterHotKey (no low-level keyboard hook).
 Run at logon (hidden): pythonw.exe app.py
 """
 
-from openpyxl import load_workbook
 from dotenv import load_dotenv
 import requests
 import pyperclip
@@ -27,7 +26,7 @@ from router.rag import (
     warmup as rag_warmup,
 )
 from router.meta_router import complete
-from router.documents import read_pdf
+from router.documents import extract_text as extract_document_text, read_pdf
 from router.images import (
     ImageAttachment,
     attachment_from_clipboard,
@@ -88,12 +87,13 @@ def _log_llm_request(
     logging.info("Context files: %s", files_str)
     logging.info("Context images: %s", images_str)
     logging.info("Context mode: %s", context_mode)
-    logging.info("User prompt (%d chars):\n%s", len(user_prompt), prompt_for_log)
+    logging.info("User prompt (%d chars):\n%s",
+                 len(user_prompt), prompt_for_log)
 
 
 NTFY_MAX_BODY = 3500
 APP_NAME = "Clip Assist"
-APP_BUILD = "2026-05-24-open-query-strict-v3"
+APP_BUILD = "2026-05-24-topic-filter-v2"
 HOTKEY_ID = 1
 MUTEX_NAME = "Global\\ClipAssistSvc"
 ERROR_ALREADY_EXISTS = 183
@@ -155,7 +155,34 @@ _base_instruction = (
     "Do not use Unicode maths symbols (no pi, rho, multiply sign, divide sign, square root sign, etc.).\n"
     "Spell Greek letters in words (pi, rho, eta) - never use Greek symbol characters.\n"
     "Do not use LaTeX, markdown, or special formatting.\n"
+    "Use compact units only: MW, kW, kWh, kJ/kg, t/h, deg C, %. "
+    "Do not spell out megawatt, kilowatt, kilojoule, or degrees Celsius.\n"
+    "Show each calculation once in a short line. Do not repeat wrong attempts, "
+    "unit conversion loops, or self-corrections.\n"
     "Use New Zealand styled English.\n"
+    "CONTEXT RULES:\n"
+    "- If context is provided, use it as the primary source of data, constants, and method.\n"
+    "- If context includes a worked example or solution sheet, apply the same formula and approach "
+    "to the current question with the given data values. Do not switch to a different method.\n"
+    "- Use exact constants from context (e.g. heat capacity, efficiencies, conversion factors). "
+    "Do not substitute generic textbook values if the context provides them.\n"
+    "- If specific numeric data (e.g. solar resource, flow rate) is not in context, state that "
+    "clearly and work with the data given in the question only.\n"
+    "- If context is provided but covers a different scenario (e.g. a hotel vs a school), "
+    "still use its formula structure and constants for this question.\n"
+    "- Do not say 'the exact value is not provided' if context gives a method to calculate it.\n"
+    "- If context is labelled WORKED EXAMPLE, use only its formula/method; "
+    "do NOT use its numerical results (area, volume, demand) as the answer.\n"
+    "COURSE CONSTANTS (RESE321 — use these unless the question states otherwise):\n"
+    "- Water volumetric heat capacity: 1.160 kWh/m3/K (= 4176 kJ/m3/K).\n"
+    "  Pool/tank energy: Q = volume_m3 * 1.160 * delta_T_K (kWh). "
+    "This gives daily energy needed to maintain temperature against ambient losses.\n"
+    "- Flat plate collector efficiency: ~0.63 (use coefficient method from lecture 3-2 if given).\n"
+    "- Evacuated tube collector efficiency: ~0.66.\n"
+    "- Solar resource for area calc: use the MINIMUM cumulative daily resource (kWh/m2/day), "
+    "not the monthly average, to ensure the system works on the worst day.\n"
+    "- Collector area formula: A = Q_daily / (resource_min * eta) in m2.\n"
+    "- Do NOT use 4.184 kJ/kg/K for pool/tank volume problems — use 1.160 kWh/m3/K instead.\n"
 )
 
 _busy = threading.Lock()
@@ -227,15 +254,7 @@ def _load_files_from_dir(folder: Path, file_data: str) -> str:
 
         elif filename.endswith(".xlsx"):
             try:
-                wb = load_workbook(file_path, data_only=True)
-                text = ""
-                for sheet in wb.worksheets:
-                    text += f"\nSheet: {sheet.title}\n"
-                    for row in sheet.iter_rows(values_only=True):
-                        row_text = [
-                            str(cell) if cell is not None else "" for cell in row
-                        ]
-                        text += " | ".join(row_text) + "\n"
+                text = extract_document_text(file_path)
                 file_data += f"\n\nFile ({filename}):\n{text}"
             except Exception:
                 file_data += f"\n\nFile ({filename}) could not be read."
@@ -284,7 +303,8 @@ def load_prompt_context(question: str) -> tuple[str, str, list[str]]:
       - empty: no files / no matches
     """
     if rag_enabled() and CONTEXT_PATH.is_dir():
-        retrieved, status, sources = rag_retrieve(question, CONTEXT_PATH, APP_DIR)
+        retrieved, status, sources = rag_retrieve(
+            question, CONTEXT_PATH, APP_DIR)
         if retrieved.strip():
             return retrieved, "rag", sources
         if status == "below_threshold":
@@ -303,9 +323,11 @@ def load_prompt_context(question: str) -> tuple[str, str, list[str]]:
             )
             return "", "empty", []
         if status == "empty_index":
-            logging.info("RAG index missing; falling back to capped context/ files.")
+            logging.info(
+                "RAG index missing; falling back to capped context/ files.")
         else:
-            logging.info("RAG found no chunks; falling back to capped context/ files.")
+            logging.info(
+                "RAG found no chunks; falling back to capped context/ files.")
         fallback = load_context_files()
         if fallback.strip():
             all_files = [
@@ -336,7 +358,8 @@ def load_context_images(question: str, text_filters: list[str] | None = None) ->
             for p in iter_source_files(CONTEXT_PATH)
         ]
         image_sources = list_context_image_names(CONTEXT_PATH)
-        text_filters = infer_source_filters(question, text_sources + image_sources)
+        text_filters = infer_source_filters(
+            question, text_sources + image_sources)
     images = collect_matching_from_dir(CONTEXT_PATH, question, text_filters)
     if images:
         names = ", ".join(img.label for img in images)

@@ -12,11 +12,15 @@ import time
 from pathlib import Path
 
 from router.documents import extract_text, iter_source_files
+from router.embeddings import embedding_fingerprint, get_embedding_function
 from router.rag_sources import (
     chunk_body_for_prompt,
     expand_query_with_sources,
+    find_companion_solutions,
     infer_source_filters,
+    match_explicit_filenames,
     prepare_chunk_for_embedding,
+    slice_xlsx_for_question,
 )
 from router.stdio import patch_pythonw_stdio
 
@@ -25,6 +29,7 @@ logger = logging.getLogger(__name__)
 _lock = None  # lazy threading.Lock() — Chroma queries + index swap only
 _rebuild_schedule_lock = None  # prevents parallel full rebuilds
 _collection_name = "clip_context"
+_build_lock_name = ".rag_build.lock"
 _client = None
 _client_index_path: str | None = None
 
@@ -212,28 +217,80 @@ def chunk_overlap() -> int:
         return 120
 
 
+_LIVE_INDEX_NAME = "rag_index"
+_PENDING_INDEX_NAME = "rag_index_pending"
+_ACTIVE_INDEX_MARKER = ".rag_index_active"
+
+
+def live_index_dir(base: Path) -> Path:
+    return base.resolve() / _LIVE_INDEX_NAME
+
+
 def index_dir(base: Path) -> Path:
-    return base / "rag_index"
+    """Active Chroma directory (live, pending override, or whichever has a DB)."""
+    base = base.resolve()
+    marker = base / _ACTIVE_INDEX_MARKER
+    if marker.is_file():
+        rel = marker.read_text(encoding="utf-8").strip()
+        if rel:
+            path = base / rel
+            if (path / "chroma.sqlite3").is_file():
+                return path
+    live = live_index_dir(base)
+    if (live / "chroma.sqlite3").is_file():
+        return live
+    pending = base / _PENDING_INDEX_NAME
+    if (pending / "chroma.sqlite3").is_file():
+        return pending
+    return live
 
 
 def manifest_path(base: Path) -> Path:
     return index_dir(base) / "manifest.json"
 
 
-def _embedding_function(base_dir: Path):
-    """
-    Chroma's default ONNX embedder writes to ~/.cache/chroma, which often breaks under
-    pythonw (permission errors). Force models into the project .chroma_cache folder.
-    """
-    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+def _set_active_index(base: Path, folder_name: str) -> None:
+    (base / _ACTIVE_INDEX_MARKER).write_text(folder_name, encoding="utf-8")
 
-    cache_root = (
-        base_dir / ".chroma_cache" / "onnx_models" / "all-MiniLM-L6-v2"
-    ).resolve()
-    cache_root.mkdir(parents=True, exist_ok=True)
-    ef = ONNXMiniLM_L6_V2()
-    ef.DOWNLOAD_PATH = cache_root
-    return ef
+
+def _clear_active_index(base: Path) -> None:
+    try:
+        (base / _ACTIVE_INDEX_MARKER).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def consolidate_pending_index(base_dir: Path) -> bool:
+    """
+    Move rag_index_pending/ over rag_index/ when the live folder is not locked.
+    Returns True when consolidated.
+    """
+    base_dir = base_dir.resolve()
+    pending = base_dir / _PENDING_INDEX_NAME
+    live = live_index_dir(base_dir)
+    if not (pending / "chroma.sqlite3").is_file():
+        return False
+
+    _release_filesystem_locks()
+    backup = base_dir / f"rag_index_prev_{int(time.time())}"
+    if backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+
+    try:
+        if live.exists():
+            shutil.move(str(live), str(backup))
+        shutil.move(str(pending), str(live))
+        _clear_active_index(base_dir)
+        logger.info("RAG: consolidated %s into %s/.", _PENDING_INDEX_NAME, _LIVE_INDEX_NAME)
+        return True
+    except OSError as exc:
+        logger.debug("RAG pending consolidate skipped: %s", exc)
+        return False
+
+
+def _embedding_function(base_dir: Path):
+    """Chroma Cloud embeddings when CHROMA_API_KEY is set; else local ONNX MiniLM."""
+    return get_embedding_function(base_dir)
 
 
 def _file_signature(path: Path) -> dict:
@@ -249,20 +306,26 @@ def _scan_signatures(source_dir: Path) -> dict[str, dict]:
     return sigs
 
 
-def _load_manifest(path: Path) -> dict[str, dict]:
+def _read_manifest(path: Path) -> dict:
     if not path.is_file():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data.get("files", {})
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _load_manifest(path: Path) -> dict[str, dict]:
+    return _read_manifest(path).get("files", {})
 
 
 def _save_manifest(path: Path, files: dict[str, dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"files": files}, indent=2),
+        json.dumps(
+            {"files": files, "embedding": embedding_fingerprint()},
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -448,8 +511,10 @@ def _named_file_max_chars() -> int:
         return 12000
 
 
-def _populate_index_at(idx_path: Path, source_dir: Path, base_dir: Path) -> int:
-    """Write chunks into a fresh index directory (does not use the live app client)."""
+def populate_index_inprocess(
+    idx_path: Path, source_dir: Path, base_dir: Path
+) -> int:
+    """Write chunks into a fresh index directory (in-process; used by child on Windows)."""
     import chromadb
     from chromadb.config import Settings
 
@@ -494,20 +559,127 @@ def _populate_index_at(idx_path: Path, source_dir: Path, base_dir: Path) -> int:
                 metadatas=metadatas[i : i + batch],
             )
 
-    return len(documents)
+    count = len(documents)
+    del collection
+    del client
+    gc.collect()
+    return count
+
+
+def _populate_index_at(idx_path: Path, source_dir: Path, base_dir: Path) -> int:
+    """
+    Build index at idx_path.
+
+    On Windows, run in a subprocess so SQLite/HNSW files are not locked during promote.
+    """
+    if os.name != "nt":
+        return populate_index_inprocess(idx_path, source_dir, base_dir)
+
+    import subprocess
+    import sys
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "router.rag_populate",
+        str(idx_path.resolve()),
+        str(source_dir.resolve()),
+        str(base_dir.resolve()),
+    ]
+    env = os.environ.copy()
+    env.setdefault(
+        "CHROMA_CACHE_DIR",
+        str((base_dir / ".chroma_cache").resolve()),
+    )
+    result = subprocess.run(
+        cmd,
+        cwd=str(base_dir.resolve()),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"RAG index subprocess failed (exit {result.returncode}): {detail}"
+        )
+    return int((result.stdout or "0").strip().splitlines()[-1])
+
+
+def _release_filesystem_locks() -> None:
+    _close_client()
+    for _ in range(3):
+        gc.collect()
+        time.sleep(0.35)
 
 
 def _promote_staging_index(staging: Path, idx_path: Path, base_dir: Path) -> None:
-    """Swap a finished staging index into place without deleting the live index first."""
-    if idx_path.exists():
+    """
+    Install staging index: copy to rag_index/ when possible, else rag_index_pending/
+    with an active-index marker (Clip Assist can query pending while live is locked).
+    """
+    _release_filesystem_locks()
+    pending = base_dir / _PENDING_INDEX_NAME
+    if pending.exists():
+        shutil.rmtree(pending, ignore_errors=True)
+
+    last_exc: OSError | None = None
+    for attempt in range(6):
+        try:
+            shutil.copytree(staging, pending)
+            last_exc = None
+            break
+        except OSError as exc:
+            last_exc = exc
+            _release_filesystem_locks()
+            time.sleep(0.5 * (attempt + 1))
+    if last_exc is not None:
+        raise RuntimeError(
+            "Could not copy RAG staging index. Stop Clip Assist and retry."
+        ) from last_exc
+
+    live = idx_path
+    installed_live = False
+    if live.exists():
         backup = base_dir / f"rag_index_prev_{int(time.time())}"
         if backup.exists():
             shutil.rmtree(backup, ignore_errors=True)
+        for attempt in range(6):
+            try:
+                shutil.move(str(live), str(backup))
+                shutil.move(str(pending), str(live))
+                _clear_active_index(base_dir)
+                installed_live = True
+                break
+            except OSError:
+                _release_filesystem_locks()
+                time.sleep(0.5 * (attempt + 1))
+    else:
         try:
-            shutil.move(str(idx_path), str(backup))
+            shutil.move(str(pending), str(live))
+            _clear_active_index(base_dir)
+            installed_live = True
         except OSError:
-            shutil.rmtree(idx_path, ignore_errors=True)
-    shutil.move(str(staging), str(idx_path))
+            pass
+
+    if not installed_live:
+        _set_active_index(base_dir, _PENDING_INDEX_NAME)
+        logger.warning(
+            "RAG: %s is locked; installed new index at %s/. "
+            "Stop Clip Assist and run scripts\\index_rag.bat to consolidate.",
+            _LIVE_INDEX_NAME,
+            _PENDING_INDEX_NAME,
+        )
+
+    for attempt in range(6):
+        try:
+            _clear_staging_dir(staging)
+            break
+        except OSError:
+            _release_filesystem_locks()
+            time.sleep(0.5 * (attempt + 1))
+    else:
+        logger.warning("RAG staging folder could not be removed; safe to delete %s", staging)
 
 
 def _try_named_disk_context(
@@ -516,19 +688,26 @@ def _try_named_disk_context(
     source_filter: list[str],
     *,
     reason: str,
+    question: str = "",
+    force: bool = False,
 ) -> tuple[str, str, list[str]] | None:
     """Load named context/ files without opening Chroma (fast path during rebuild)."""
     if not source_filter:
         return None
 
-    manifest_files = _load_manifest(manifest_path(base_dir))
-    not_indexed = [s for s in source_filter if s not in manifest_files]
-    stale = index_is_stale(source_dir, base_dir)
-    load_list = source_filter if stale else not_indexed
-    if not load_list:
-        return None
+    if force:
+        load_list = list(source_filter)
+    else:
+        manifest_files = _load_manifest(manifest_path(base_dir))
+        not_indexed = [s for s in source_filter if s not in manifest_files]
+        stale = index_is_stale(source_dir, base_dir)
+        load_list = source_filter if stale else not_indexed
+        if not load_list:
+            return None
 
-    disk_text, loaded = _load_named_sources_from_disk(source_dir, load_list)
+    disk_text, loaded = _load_named_sources_from_disk(
+        source_dir, load_list, question=question
+    )
     if not disk_text:
         return None
     logger.info("RAG loaded from disk (%s): %s", reason, ", ".join(loaded))
@@ -536,7 +715,10 @@ def _try_named_disk_context(
 
 
 def _load_named_sources_from_disk(
-    source_dir: Path, sources: list[str]
+    source_dir: Path,
+    sources: list[str],
+    *,
+    question: str = "",
 ) -> tuple[str, list[str]]:
     """Read named context/ files when they are not in the Chroma index yet."""
     max_chars = _named_file_max_chars()
@@ -548,6 +730,8 @@ def _load_named_sources_from_disk(
             logger.warning("RAG: named file not found on disk: %s", rel)
             continue
         text = extract_text(path).strip()
+        if path.suffix.lower() in (".xlsx", ".xls") and question:
+            text = slice_xlsx_for_question(text, question)
         if not text:
             logger.warning("RAG: named file empty or unreadable: %s", rel)
             continue
@@ -577,34 +761,65 @@ def _clear_staging_dir(staging: Path) -> None:
 
 
 def _staging_build_in_progress(staging: Path) -> bool:
-    if not staging.exists():
+    """True only while an active rebuild holds .rag_build.lock (not merely partial files)."""
+    started = _staging_build_started(staging)
+    if started is None:
         return False
-    return any(staging.rglob("chroma.sqlite3")) or any(staging.rglob("data_level0.bin"))
+    return (time.time() - started) <= _build_timeout_s()
+
+
+def _recover_stale_staging(staging: Path) -> None:
+    if not staging.exists():
+        return
+    if _staging_build_in_progress(staging):
+        return
+    if _staging_build_started(staging) is not None or (staging / "chroma.sqlite3").is_file():
+        logger.warning(
+            "RAG clearing abandoned staging folder (build timed out after %.0fs).",
+            _build_timeout_s(),
+        )
+        _clear_staging_dir(staging)
 
 
 def rebuild_index(source_dir: Path, base_dir: Path) -> int | None:
     """Re-ingest all files under source_dir. Returns chunk count, or None if skipped."""
     source_dir = source_dir.resolve()
     base_dir = base_dir.resolve()
-    idx_path = index_dir(base_dir)
+    idx_path = live_index_dir(base_dir)
     staging = base_dir / "rag_index_staging"
+
+    _recover_stale_staging(staging)
 
     if _staging_build_in_progress(staging):
         logger.info("RAG rebuild skipped: staging index build already in progress.")
         return None
 
+    nested_staging = idx_path / "rag_index_staging"
+    if nested_staging.exists():
+        shutil.rmtree(nested_staging, ignore_errors=True)
+
     _clear_staging_dir(staging)
     staging.mkdir(parents=True)
+    _staging_build_lock(staging).write_text(str(time.time()), encoding="utf-8")
 
-    count = _populate_index_at(staging, source_dir, base_dir)
-    _save_manifest(staging / "manifest.json", _scan_signatures(source_dir))
+    try:
+        count = _populate_index_at(staging, source_dir, base_dir)
+        _save_manifest(staging / "manifest.json", _scan_signatures(source_dir))
 
-    with _get_lock():
-        _close_client()
-        _promote_staging_index(staging, idx_path, base_dir)
+        with _get_lock():
+            _close_client()
+            _promote_staging_index(staging, idx_path, base_dir)
 
-    logger.info("RAG index built: %d chunks from %s", count, source_dir)
-    return count
+        _save_manifest(manifest_path(base_dir), _scan_signatures(source_dir))
+        logger.info("RAG index built: %d chunks from %s", count, source_dir)
+        return count
+    finally:
+        lock = _staging_build_lock(staging)
+        if lock.is_file():
+            try:
+                lock.unlink()
+            except OSError:
+                pass
 
 
 def index_is_stale(source_dir: Path, base_dir: Path) -> bool:
@@ -612,8 +827,16 @@ def index_is_stale(source_dir: Path, base_dir: Path) -> bool:
     source_dir = source_dir.resolve()
     if not source_dir.is_dir():
         return False
+    manifest = _read_manifest(manifest_path(base_dir))
+    if manifest.get("embedding") != embedding_fingerprint():
+        logger.info(
+            "RAG index stale: embedding model changed (%s -> %s).",
+            manifest.get("embedding", "none"),
+            embedding_fingerprint(),
+        )
+        return True
     current = _scan_signatures(source_dir)
-    previous = _load_manifest(manifest_path(base_dir))
+    previous = manifest.get("files", {})
     if current != previous:
         return True
     return not (index_dir(base_dir) / "chroma.sqlite3").exists()
@@ -634,6 +857,7 @@ def ensure_index(source_dir: Path, base_dir: Path) -> int | None:
         return None
 
     staging = base_dir / "rag_index_staging"
+    _recover_stale_staging(staging)
     if _staging_build_in_progress(staging):
         logger.info("RAG rebuild skipped: staging index build already in progress.")
         return None
@@ -662,6 +886,42 @@ def _watch_debounce_s() -> float:
         return max(1.0, float(os.environ.get("RAG_WATCH_DEBOUNCE_S", "3")))
     except ValueError:
         return 3.0
+
+
+def _build_timeout_s() -> float:
+    try:
+        return max(120.0, float(os.environ.get("RAG_BUILD_TIMEOUT_S", "900")))
+    except ValueError:
+        return 900.0
+
+
+def _staging_build_lock(staging: Path) -> Path:
+    return staging / _build_lock_name
+
+
+def _staging_build_started(staging: Path) -> float | None:
+    lock = _staging_build_lock(staging)
+    if not lock.is_file():
+        return None
+    try:
+        return float(lock.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _staging_build_timed_out(staging: Path) -> bool:
+    started = _staging_build_started(staging)
+    if started is not None:
+        return (time.time() - started) > _build_timeout_s()
+    sqlite = staging / "chroma.sqlite3"
+    if sqlite.is_file():
+        return (time.time() - sqlite.stat().st_mtime) > _build_timeout_s()
+    return False
+
+
+def _index_embedding_matches(base_dir: Path) -> bool:
+    manifest = _read_manifest(manifest_path(base_dir))
+    return manifest.get("embedding") == embedding_fingerprint()
 
 
 def _watch_enabled() -> bool:
@@ -873,9 +1133,27 @@ def retrieve(question: str, source_dir: Path, base_dir: Path) -> tuple[str, str,
         for p in iter_source_files(source_dir)
     ]
     source_filter = infer_source_filters(question, known_sources)
+    explicit_files = match_explicit_filenames(question, known_sources)
+
+    if explicit_files:
+        disk_hit = _try_named_disk_context(
+            source_dir,
+            base_dir,
+            explicit_files,
+            reason="file named in question",
+            question=question,
+            force=True,
+        )
+        if disk_hit:
+            return disk_hit
+        source_filter = explicit_files
 
     disk_hit = _try_named_disk_context(
-        source_dir, base_dir, source_filter, reason="index pending or not indexed"
+        source_dir,
+        base_dir,
+        source_filter,
+        reason="index pending or not indexed",
+        question=question,
     )
     if disk_hit:
         return disk_hit
@@ -892,6 +1170,22 @@ def retrieve(question: str, source_dir: Path, base_dir: Path) -> tuple[str, str,
             source_dir,
         )
         return "", "empty_index", []
+
+    if not _index_embedding_matches(base_dir):
+        disk_hit = _try_named_disk_context(
+            source_dir,
+            base_dir,
+            source_filter,
+            reason="embedding migration (re-index in progress)",
+        )
+        if disk_hit:
+            return disk_hit
+        logger.info(
+            "RAG index uses %s; current config is %s — skipping vector search until re-index completes.",
+            _read_manifest(manifest_path(base_dir)).get("embedding", "none"),
+            embedding_fingerprint(),
+        )
+        return "", "busy", []
 
     t0 = time.perf_counter()
     lock = _get_lock()
@@ -987,8 +1281,22 @@ def retrieve(question: str, source_dir: Path, base_dir: Path) -> tuple[str, str,
                 dist_limit,
             )
     except Exception as exc:
+        msg = str(exc)
+        if "dimension" in msg.lower():
+            logger.info(
+                "RAG query skipped: index embedding dimension mismatch (re-index required)."
+            )
+            disk_hit = _try_named_disk_context(
+                source_dir,
+                base_dir,
+                source_filter,
+                reason="embedding dimension mismatch",
+            )
+            if disk_hit:
+                return disk_hit
+            return "", "busy", []
         logger.warning("RAG query failed: %s", exc)
-        _note_rag_failure(str(exc))
+        _note_rag_failure(msg)
         return "", "error", []
     finally:
         lock.release()
@@ -1039,6 +1347,36 @@ def retrieve(question: str, source_dir: Path, base_dir: Path) -> tuple[str, str,
     sources_used = list(dict.fromkeys(
         m.get("source", "") for m in meta_list if m and m.get("source")
     ))
+
+    # Companion solutions: when a lecture PDF was retrieved, also load its
+    # worked-solutions xlsx from disk so the model sees the full method.
+    companions = find_companion_solutions(sources_used, known_sources)
+    if companions:
+        companion_text, companion_loaded = _load_named_sources_from_disk(
+            source_dir, companions, question=question
+        )
+        if companion_text:
+            # Wrap with a clear header so the model uses the method, not the numbers
+            companion_header = (
+                "[WORKED EXAMPLE — DIFFERENT SCENARIO]\n"
+                "The following solution is from a different problem in the same topic.\n"
+                "Use its formula structure, constants, and method for the current question.\n"
+                "Do NOT copy its numerical results — recalculate using the data in the question above.\n"
+            )
+            companion_block = companion_header + companion_text
+            cap = _prompt_max_chars()
+            combined = companion_block + "\n\n" + formatted
+            if len(combined) > cap:
+                combined = combined[:cap].rstrip() + "\n\n[... context truncated ...]"
+            formatted = combined
+            sources_used = companion_loaded + [
+                s for s in sources_used if s not in companion_loaded
+            ]
+            logger.info(
+                "RAG: appended companion solution(s) from disk: %s",
+                ", ".join(companion_loaded),
+            )
+
     logger.info(
         "RAG retrieved %d chunk(s) in %.2fs from [%s] (%d chars, index %d chunks).",
         len(docs),
@@ -1058,6 +1396,7 @@ def warmup(base_dir: Path, source_dir: Path) -> None:
     if not is_enabled() or not source_dir.is_dir():
         return
     try:
+        consolidate_pending_index(base_dir)
         if index_is_stale(source_dir, base_dir):
             logger.info("RAG: building index in background (hotkeys stay responsive).")
         count = ensure_index(source_dir, base_dir)
