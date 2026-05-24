@@ -2,6 +2,9 @@
 app.log
 router/state.json
 rag_index/
+rag_index_staging/
+rag_index_prev_*/
 rag_index_locked_*/
 .chroma_cache/
 context/
+__pycache__/

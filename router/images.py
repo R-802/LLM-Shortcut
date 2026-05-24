@@ -109,3 +109,28 @@ def collect_from_dirs(*folders: Path) -> list[ImageAttachment]:
             if len(found) >= MAX_IMAGES:
                 return found
     return found
+
+
+def collect_matching_from_dir(
+    folder: Path,
+    question: str,
+    text_filters: list[str],
+) -> list[ImageAttachment]:
+    """Load images from folder only when filename matches the question (see rag_sources)."""
+    from router.rag_sources import image_matches_question
+
+    if not folder.is_dir():
+        return []
+
+    found: list[ImageAttachment] = []
+    for path in sorted(folder.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        if not image_matches_question(path.name, question, text_filters):
+            continue
+        att = attachment_from_path(path)
+        if att:
+            found.append(att)
+        if len(found) >= MAX_IMAGES:
+            break
+    return found

@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0.."
+echo Optional manual RAG rebuild. Clip Assist auto-re-indexes context/ when running.
 echo Stopping Clip Assist so the RAG index is not locked...
 taskkill /F /IM pythonw.exe >nul 2>&1
 timeout /t 2 /nobreak >nul

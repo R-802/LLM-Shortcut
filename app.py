@@ -20,14 +20,21 @@ import sys
 import os
 import ctypes
 from router.sanitize import sanitize_answer
-from router.rag import build_context_block, is_enabled as rag_enabled, warmup as rag_warmup
+from router.rag import (
+    is_enabled as rag_enabled,
+    retrieve as rag_retrieve,
+    start_index_watcher as rag_start_index_watcher,
+    warmup as rag_warmup,
+)
 from router.meta_router import complete
 from router.documents import read_pdf
 from router.images import (
     ImageAttachment,
     attachment_from_clipboard,
-    collect_from_dirs,
+    collect_matching_from_dir,
 )
+from router.rag_sources import infer_source_filters, list_context_image_names
+from router.documents import iter_source_files
 from router.hotkey import load_hotkey_from_env
 from router.stdio import patch_pythonw_stdio
 
@@ -52,9 +59,41 @@ def _context_fallback_max_chars() -> int:
         return 12000
 
 
+def _log_prompt_max_chars() -> int:
+    try:
+        return max(500, int(os.environ.get("LOG_PROMPT_MAX_CHARS", "8000")))
+    except ValueError:
+        return 8000
+
+
+def _log_llm_request(
+    question: str,
+    user_prompt: str,
+    context_files: list[str],
+    context_mode: str,
+    image_labels: list[str],
+) -> None:
+    """Log the question, attached files, and full user prompt sent to the model."""
+    max_log = _log_prompt_max_chars()
+    if len(user_prompt) <= max_log:
+        prompt_for_log = user_prompt
+    else:
+        prompt_for_log = (
+            user_prompt[:max_log]
+            + f"\n\n[... prompt truncated for log ({len(user_prompt)} chars total) ...]"
+        )
+    files_str = ", ".join(context_files) if context_files else "(none)"
+    images_str = ", ".join(image_labels) if image_labels else "(none)"
+    logging.info("Request question: %s", question)
+    logging.info("Context files: %s", files_str)
+    logging.info("Context images: %s", images_str)
+    logging.info("Context mode: %s", context_mode)
+    logging.info("User prompt (%d chars):\n%s", len(user_prompt), prompt_for_log)
+
+
 NTFY_MAX_BODY = 3500
 APP_NAME = "Clip Assist"
-APP_BUILD = "2026-05-23-meta-router"
+APP_BUILD = "2026-05-24-tutorial-filter-fix"
 HOTKEY_ID = 1
 MUTEX_NAME = "Global\\ClipAssistSvc"
 ERROR_ALREADY_EXISTS = 183
@@ -234,34 +273,79 @@ def load_context_files() -> str:
     return _truncate_context(raw, _context_fallback_max_chars(), "Fallback context")
 
 
-def load_prompt_context(question: str) -> tuple[str, str]:
+def load_prompt_context(question: str) -> tuple[str, str, list[str]]:
     """
     Load context for the prompt.
 
-    Returns (context_text, mode):
+    Returns (context_text, mode, source_paths):
       - rag: top-K chunks from ChromaDB for this question
       - fallback: capped dump of context/ files (RAG off or failed)
       - off: RAG disabled and no fallback
       - empty: no files / no matches
     """
     if rag_enabled() and CONTEXT_PATH.is_dir():
-        rag_text = build_context_block(question, CONTEXT_PATH, APP_DIR)
-        if rag_text.strip():
-            return rag_text, "rag"
-        logging.info(
-            "RAG found no chunks; falling back to capped context/ files.")
+        retrieved, status, sources = rag_retrieve(question, CONTEXT_PATH, APP_DIR)
+        if retrieved.strip():
+            return retrieved, "rag", sources
+        if status == "below_threshold":
+            logging.info(
+                "RAG: question unrelated to context/; no file context attached."
+            )
+            return "", "empty", []
+        if status == "named_file_missing":
+            logging.warning(
+                "RAG: named document(s) could not be loaded; no file context attached."
+            )
+            return "", "empty", sources
+        if status == "busy":
+            logging.warning(
+                "RAG: index busy (rebuild in progress); no file context attached."
+            )
+            return "", "empty", []
+        if status == "empty_index":
+            logging.info("RAG index missing; falling back to capped context/ files.")
+        else:
+            logging.info("RAG found no chunks; falling back to capped context/ files.")
         fallback = load_context_files()
-        return fallback, "fallback" if fallback.strip() else "empty"
+        if fallback.strip():
+            all_files = [
+                p.relative_to(CONTEXT_PATH).as_posix()
+                for p in iter_source_files(CONTEXT_PATH)
+            ]
+            return fallback, "fallback", all_files
+        return "", "empty", []
     if not rag_enabled() and CONTEXT_PATH.is_dir():
         fallback = load_context_files()
-        return fallback, "fallback" if fallback.strip() else "empty"
-    return "", "off"
+        if fallback.strip():
+            all_files = [
+                p.relative_to(CONTEXT_PATH).as_posix()
+                for p in iter_source_files(CONTEXT_PATH)
+            ]
+            return fallback, "fallback", all_files
+        return "", "empty", []
+    return "", "off", []
 
 
-def load_context_images() -> list[ImageAttachment]:
+def load_context_images(question: str, text_filters: list[str] | None = None) -> list[ImageAttachment]:
+    """Attach context/ images only when the filename matches the question."""
     if not CONTEXT_PATH.is_dir():
         return []
-    return collect_from_dirs(CONTEXT_PATH)
+    if text_filters is None:
+        text_sources = [
+            p.relative_to(CONTEXT_PATH).as_posix()
+            for p in iter_source_files(CONTEXT_PATH)
+        ]
+        image_sources = list_context_image_names(CONTEXT_PATH)
+        text_filters = infer_source_filters(question, text_sources + image_sources)
+    images = collect_matching_from_dir(CONTEXT_PATH, question, text_filters)
+    if images:
+        names = ", ".join(img.label for img in images)
+        logging.info("Context images attached (filename match): %s", names)
+    elif list_context_image_names(CONTEXT_PATH):
+        logging.info(
+            "Context images skipped: no filename match for this question."
+        )
+    return images
 
 
 def send_ctrl_c() -> None:
@@ -302,17 +386,32 @@ def capture_from_clipboard() -> tuple[str, list[ImageAttachment]]:
 
 def ask_llm(question: str, images: list[ImageAttachment] | None = None) -> tuple[str, str]:
     """Return (answer, provider_id) via meta-router."""
-    file_data, context_mode = load_prompt_context(question)
+    text_sources = []
+    image_sources: list[str] = []
+    if CONTEXT_PATH.is_dir():
+        text_sources = [
+            p.relative_to(CONTEXT_PATH).as_posix()
+            for p in iter_source_files(CONTEXT_PATH)
+        ]
+        image_sources = list_context_image_names(CONTEXT_PATH)
+    source_filters = infer_source_filters(
+        question, text_sources + image_sources
+    )
+
+    file_data, context_mode, context_files = load_prompt_context(question)
     user = f"Question:\n{question}\n\nContext:\n{file_data}"
 
     all_images: list[ImageAttachment] = []
-    all_images.extend(load_context_images())
+    all_images.extend(load_context_images(question, source_filters))
     if images:
         for img in images:
             if not any(i.label == img.label for i in all_images):
                 all_images.append(img)
     if len(all_images) > 6:
         all_images = all_images[:6]
+
+    image_labels = [img.label for img in all_images]
+    _log_llm_request(question, user, context_files, context_mode, image_labels)
 
     answer, meta = complete(
         system=_base_instruction,
@@ -348,18 +447,19 @@ def _handle_hotkey() -> None:
 
     try:
         question, clip_images = capture_from_clipboard()
-        context_images = load_context_images()
-        has_images = bool(clip_images or context_images)
 
-        if not question and not has_images:
+        if not question and not clip_images:
             pyperclip.copy("No text or image selected.")
             logging.warning("Empty selection.")
             ntfy_notify(APP_NAME,
                         "No text or image selected.", priority="3")
             return
 
-        if not question and has_images:
+        if not question:
             question = "Answer the question shown in the image(s)."
+
+        context_images = load_context_images(question)
+        has_images = bool(clip_images or context_images)
 
         preview = question[:120] + ("…" if len(question) > 120 else "")
         # ntfy_notify(APP_NAME, f"Working on:\n{preview}", priority="1")
@@ -432,6 +532,7 @@ def main() -> None:
     )
 
     if rag_enabled():
+        rag_start_index_watcher(CONTEXT_PATH, APP_DIR)
         threading.Thread(
             target=rag_warmup,
             args=(APP_DIR, CONTEXT_PATH),

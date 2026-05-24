@@ -10,8 +10,9 @@
 2. **Start:** double-click **Clip Assist** on your Desktop (or `scripts\start_clip_assist.vbs`).
 3. **Stop logon task** if you used it before: `scripts\remove_from_startup.bat`.
 4. Put study files in **`context/`** (PDF, xlsx, txt, md).
-5. **RAG_ENABLED=true** (in `.env`): run **`scripts\index_rag.bat`** after adding or changing files (stops Clip Assist first). Only the top **RAG_TOP_K** chunks are sent. Each chunk is tagged with the **filename** in the index; questions like `tutorial one` filter to `RESE321_Tutorial_1.*`.
-6. In `app.log`, look for `RAG document filter: RESE321_Tutorial_1.xlsx` and `RAG retrieved N chunk(s) ... from [that file]`. Re-run **`index_rag.bat`** after code changes to re-index.
+5. **RAG_ENABLED=true** (in `.env`): add or change files in **`context/`** while Clip Assist is running — the app re-indexes automatically (see `RAG: auto re-indexed` in `app.log`). Optional: **`scripts\index_rag.bat`** for a manual rebuild. Only the top **RAG_TOP_K** chunks are sent. Each chunk is tagged with the **filename** in the index; questions like `tutorial one` filter to `RESE321_Tutorial_1.*`.
+6. In `app.log`, look for `RAG document filter: RESE321_Tutorial_1.xlsx` and `RAG retrieved N chunk(s) ... from [that file]`. Unrelated questions log `below relevance threshold` and send **no** context (`context_mode=empty`). Tune **`RAG_MAX_DISTANCE`** in `.env` (default `0.82`, lower = stricter).
+7. **Images in `context/`** are only attached when the **filename** matches the question (e.g. `tutorial 6` → `Tutorial_6.png`; unrelated prompts skip context images). Clipboard images are unchanged.
 6. For development restarts: **`scripts\restart_service.bat`** (add `--nopause` to skip the final pause).
 
 ## Quick CLI test (no hotkey)
