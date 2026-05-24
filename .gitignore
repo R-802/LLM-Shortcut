@@ -2,3 +2,6 @@
 app.log
 router/state.json
 rag_index/
+rag_index_locked_*/
+.chroma_cache/
+context/

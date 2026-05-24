@@ -6,34 +6,33 @@ Uses Windows RegisterHotKey (no low-level keyboard hook).
 Run at logon (hidden): pythonw.exe app.py
 """
 
-from router.stdio import patch_pythonw_stdio
-
-patch_pythonw_stdio()
-
-from router.hotkey import load_hotkey_from_env
+from openpyxl import load_workbook
+from dotenv import load_dotenv
+import requests
+import pyperclip
+from pathlib import Path
+from ctypes import wintypes
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+import logging
+import threading
+import time
+import sys
+import os
+import ctypes
+from router.sanitize import sanitize_answer
+from router.rag import build_context_block, is_enabled as rag_enabled, warmup as rag_warmup
+from router.meta_router import complete
+from router.documents import read_pdf
 from router.images import (
     ImageAttachment,
     attachment_from_clipboard,
     collect_from_dirs,
 )
-from router.documents import read_pdf
-from router.meta_router import complete
-from router.rag import build_context_block, is_enabled as rag_enabled
-from router.sanitize import sanitize_answer
-import ctypes
-import os
-import sys
-import time
-import threading
-import logging
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from ctypes import wintypes
-from pathlib import Path
+from router.hotkey import load_hotkey_from_env
+from router.stdio import patch_pythonw_stdio
 
-import pyperclip
-import requests
-from dotenv import load_dotenv
-from openpyxl import load_workbook
+patch_pythonw_stdio()
+
 
 APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
@@ -44,6 +43,15 @@ load_dotenv(APP_DIR / ".env")
 LOG_PATH = APP_DIR / "app.log"
 CONTEXT_PATH = APP_DIR / "context"
 REQUEST_TIMEOUT_S = max(30, int(os.environ.get("REQUEST_TIMEOUT_S", "90")))
+
+
+def _context_fallback_max_chars() -> int:
+    try:
+        return max(2000, int(os.environ.get("CONTEXT_FALLBACK_MAX_CHARS", "12000")))
+    except ValueError:
+        return 12000
+
+
 NTFY_MAX_BODY = 3500
 APP_NAME = "Clip Assist"
 APP_BUILD = "2026-05-23-meta-router"
@@ -203,22 +211,51 @@ def _load_files_from_dir(folder: Path, file_data: str) -> str:
     return file_data
 
 
+def _truncate_context(text: str, max_chars: int, label: str) -> str:
+    text = text.strip()
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    logging.warning(
+        "%s truncated from %d to %d chars (raise CONTEXT_FALLBACK_MAX_CHARS in .env).",
+        label,
+        len(text),
+        max_chars,
+    )
+    return text[:max_chars] + "\n\n[... context truncated ...]"
+
+
 def load_context_files() -> str:
-    """Load full file text from context/ (used when RAG is off or returns nothing)."""
+    """Load text from context/ files (fallback when RAG returns nothing)."""
     if not CONTEXT_PATH.is_dir():
         return ""
-    return _load_files_from_dir(CONTEXT_PATH, "")
+    raw = _load_files_from_dir(CONTEXT_PATH, "")
+    return _truncate_context(raw, _context_fallback_max_chars(), "Fallback context")
 
 
-def load_prompt_context(question: str) -> str:
-    """RAG retrieval from context/ when enabled; otherwise dump context files."""
+def load_prompt_context(question: str) -> tuple[str, str]:
+    """
+    Load context for the prompt.
+
+    Returns (context_text, mode):
+      - rag: top-K chunks from ChromaDB for this question
+      - fallback: capped dump of context/ files (RAG off or failed)
+      - off: RAG disabled and no fallback
+      - empty: no files / no matches
+    """
     if rag_enabled() and CONTEXT_PATH.is_dir():
         rag_text = build_context_block(question, CONTEXT_PATH, APP_DIR)
         if rag_text.strip():
-            return rag_text
+            return rag_text, "rag"
         logging.info(
-            "RAG found no chunks; falling back to full context files.")
-    return load_context_files()
+            "RAG found no chunks; falling back to capped context/ files.")
+        fallback = load_context_files()
+        return fallback, "fallback" if fallback.strip() else "empty"
+    if not rag_enabled() and CONTEXT_PATH.is_dir():
+        fallback = load_context_files()
+        return fallback, "fallback" if fallback.strip() else "empty"
+    return "", "off"
 
 
 def load_context_images() -> list[ImageAttachment]:
@@ -265,7 +302,7 @@ def capture_from_clipboard() -> tuple[str, list[ImageAttachment]]:
 
 def ask_llm(question: str, images: list[ImageAttachment] | None = None) -> tuple[str, str]:
     """Return (answer, provider_id) via meta-router."""
-    file_data = load_prompt_context(question)
+    file_data, context_mode = load_prompt_context(question)
     user = f"Question:\n{question}\n\nContext:\n{file_data}"
 
     all_images: list[ImageAttachment] = []
@@ -285,15 +322,16 @@ def ask_llm(question: str, images: list[ImageAttachment] | None = None) -> tuple
     answer = sanitize_answer(answer.strip())
     logging.info(
         "Routed tier=%s provider=%s model=%s attempts=%d escalated=%s "
-        "instruction_chars=%d images=%d rag=%s",
+        "instruction_chars=%d context_chars=%d context_mode=%s images=%d",
         meta.tier,
         meta.provider_id,
         meta.litellm_model,
         meta.attempts,
         meta.escalated,
         len(_base_instruction),
+        len(file_data),
+        context_mode,
         len(all_images),
-        rag_enabled(),
     )
     return answer, meta.provider_id
 
@@ -324,7 +362,7 @@ def _handle_hotkey() -> None:
             question = "Answer the question shown in the image(s)."
 
         preview = question[:120] + ("…" if len(question) > 120 else "")
-        ntfy_notify(APP_NAME, f"Working on:\n{preview}", priority="1")
+        # ntfy_notify(APP_NAME, f"Working on:\n{preview}", priority="1")
 
         logging.info(
             "Sending %d chars, %d image(s) to meta-router.",
@@ -392,6 +430,14 @@ def main() -> None:
         f"Build {APP_BUILD} is running. {hotkey_display} is active.",
         "4",
     )
+
+    if rag_enabled():
+        threading.Thread(
+            target=rag_warmup,
+            args=(APP_DIR, CONTEXT_PATH),
+            daemon=True,
+            name="rag-warmup",
+        ).start()
 
     msg = wintypes.MSG()
     try:
